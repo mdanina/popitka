@@ -1,0 +1,26 @@
+# Конфигурация WhisperX Транскрибатора
+# Эти настройки можно переопределить через аргументы командной строки
+
+# Основные настройки
+default_language: ru  # ru или en
+default_model: small  # tiny, base, small, medium, large-v2, large-v3
+
+# Диаризация
+enable_diarization: true
+# HuggingFace токен (лучше использовать переменную окружения HF_TOKEN)
+# hf_token: "your_token_here"
+
+# Производительность (для слабых ПК)
+batch_size: 8         # Уменьшите до 4 или 2 при нехватке памяти
+compute_type: int8    # int8 для экономии памяти, float16 для GPU, float32 для точности
+
+# Вывод
+output_format: txt    # txt, json, srt
+
+# Рекомендации по выбору модели:
+# - tiny:      ~1GB RAM, быстрая, низкое качество
+# - base:      ~1GB RAM, быстрая, среднее качество
+# - small:     ~2GB RAM, оптимальный баланс для CPU
+# - medium:    ~5GB RAM, хорошее качество
+# - large-v2:  ~10GB RAM, отличное качество (нужен GPU)
+# - large-v3:  ~10GB RAM, лучшее качество (нужен GPU)
