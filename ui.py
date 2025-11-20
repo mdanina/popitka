@@ -69,6 +69,7 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
     create_nemo_manifest(audio_path, manifest_path)
 
     config = OmegaConf.create({
+        "device": device,
         "diarizer": {
             "manifest_filepath": manifest_path,
             "out_dir": output_dir,
@@ -113,12 +114,7 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
             }
         }
     })
-    
-    # Добавляем device в конфигурацию после создания (обход ограничения OmegaConf)
-    OmegaConf.set_struct(config, False)
-    config.diarizer.device = device
-    OmegaConf.set_struct(config, True)
-    
+
     sd_model = ClusteringDiarizer(cfg=config)
     sd_model.diarize()
 
