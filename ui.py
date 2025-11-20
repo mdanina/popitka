@@ -57,8 +57,14 @@ def create_nemo_manifest(audio_path: str, manifest_path: str):
         f.write('\n')
 
 
-def run_nemo_diarization(audio_path: str, output_dir: str, device: str = "cuda"):
+def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
     """Запускает диаризацию NeMo."""
+    if not NEMO_AVAILABLE:
+        raise RuntimeError("NeMo не установлен. Диаризация недоступна.")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     manifest_path = os.path.join(output_dir, "manifest.json")
     create_nemo_manifest(audio_path, manifest_path)
 
@@ -180,12 +186,15 @@ def format_output(segments, format_type, diarize):
     elif format_type == "json":
         return json.dumps({"segments": segments}, ensure_ascii=False, indent=2)
 
+    else:
+        raise ValueError(f"Неизвестный формат: {format_type}")
+
 
 def transcribe(audio_file, language, model_size, diarize, output_format, progress=gr.Progress()):
     """Основная функция транскрибации."""
 
     if audio_file is None:
-        return "Ошибка: загрузите аудиофайл", None
+        return "Ошибка: загрузите аудиофайл", None, ""
 
     device = get_device()
     compute_type = "float16" if device == "cuda" else "int8"
@@ -254,7 +263,7 @@ def transcribe(audio_file, language, model_size, diarize, output_format, progres
         # Статистика
         num_segments = len(segments)
         duration = segments[-1]["end"] if segments else 0
-        num_speakers = len(set(s.get("speaker", "") for s in segments)) if diarize else 0
+        num_speakers = len(set(s.get("speaker") for s in segments if s.get("speaker"))) if diarize else 0
 
         stats = f"Сегментов: {num_segments} | Длительность: {format_timestamp(duration)}"
         if diarize and NEMO_AVAILABLE:
@@ -273,7 +282,10 @@ def create_ui():
     device = get_device()
     device_info = f"🖥 Устройство: {device.upper()}"
     if device == "cuda":
-        device_info += f" ({torch.cuda.get_device_name(0)})"
+        try:
+            device_info += f" ({torch.cuda.get_device_name(0)})"
+        except Exception:
+            pass  # Игнорируем ошибки получения имени устройства
 
     with gr.Blocks(title="Транскрибатор", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🎙 Транскрибатор аудио")

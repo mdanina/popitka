@@ -9,6 +9,7 @@ import os
 import gc
 import json
 import tempfile
+import traceback
 import click
 import torch
 import numpy as np
@@ -114,6 +115,11 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str):
         }
     })
 
+    # Добавляем device в конфигурацию после создания (обход ограничения OmegaConf)
+    OmegaConf.set_struct(config, False)
+    config.diarizer.device = device
+    OmegaConf.set_struct(config, True)
+
     # Запуск диаризации
     sd_model = ClusteringDiarizer(cfg=config)
     sd_model.diarize()
@@ -190,6 +196,9 @@ def save_results(result: dict, output_path: Path, format_type: str):
 
                 f.write(f"{i}\n{start} --> {end}\n{text}\n\n")
         return output_path.with_suffix('.srt')
+
+    else:
+        raise ValueError(f"Неизвестный формат: {format_type}")
 
 
 @click.command()
@@ -306,7 +315,7 @@ def transcribe(audio_file, language, model, diarize, output,
                         diarization_results
                     )
 
-                num_speakers = len(set(s.get("speaker", "") for s in transcription_segments))
+                num_speakers = len(set(s.get("speaker") for s in transcription_segments if s.get("speaker")))
                 progress.update(task, description=f"[green]✓ Диаризация завершена ({num_speakers} спикеров)")
 
                 gc.collect()
@@ -334,7 +343,7 @@ def transcribe(audio_file, language, model, diarize, output,
         # Статистика
         if transcription_segments:
             total_duration = transcription_segments[-1]["end"]
-            speakers = set(s.get("speaker", "Unknown") for s in transcription_segments)
+            speakers = set(s.get("speaker") for s in transcription_segments if s.get("speaker"))
 
             stats_table = Table(title="Статистика", show_header=False, box=None)
             stats_table.add_column(style="cyan")
@@ -349,9 +358,8 @@ def transcribe(audio_file, language, model, diarize, output,
 
     except Exception as e:
         console.print(f"\n[bold red]Ошибка:[/bold red] {str(e)}")
-        import traceback
         traceback.print_exc()
-        raise click.Abort()
+        raise click.Abort() from e
 
 
 if __name__ == "__main__":
