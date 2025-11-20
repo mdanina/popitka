@@ -1,17 +1,19 @@
 # Транскрибация (быстрый Whisper для GPU)
-faster-whisper>=1.0.0
+faster-whisper>=1.1.0
 
 # Диаризация спикеров (NVIDIA NeMo - без токенов)
-nemo_toolkit[asr]>=1.23.0
+nemo_toolkit[asr]>=2.0.0
 
 # Утилиты
 pyyaml>=6.0
-tqdm>=4.65.0
+tqdm>=4.66.0
 numpy>=1.24.0
+omegaconf>=2.3.0
 
 # Обработка аудио
 pydub>=0.25.1
 librosa>=0.10.0
+soundfile>=0.12.0
 
 # CLI интерфейс
 click>=8.1.0

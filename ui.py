@@ -13,9 +13,21 @@ import torch
 import gradio as gr
 import numpy as np
 import soundfile as sf
-from pathlib import Path
 from datetime import datetime
 from faster_whisper import WhisperModel
+
+from nemo_utils import (
+    get_device,
+    create_nemo_manifest,
+    run_nemo_diarization,
+    assign_speakers_to_segments,
+    NEMO_AVAILABLE
+)
+
+# Для предзагрузки моделей
+if NEMO_AVAILABLE:
+    from omegaconf import OmegaConf
+    from nemo.collections.asr.models import ClusteringDiarizer
 
 # Список временных файлов для очистки
 _temp_files = []
@@ -30,22 +42,6 @@ def _cleanup_temp_files():
             pass
 
 atexit.register(_cleanup_temp_files)
-
-# Проверяем доступность NeMo
-try:
-    from nemo.collections.asr.models import ClusteringDiarizer
-    from omegaconf import OmegaConf
-    NEMO_AVAILABLE = True
-except ImportError:
-    NEMO_AVAILABLE = False
-    print("⚠ NeMo не установлен. Диаризация будет недоступна.")
-
-
-def get_device():
-    """Определяет доступное устройство."""
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
 
 
 def preload_nemo_models():
@@ -105,121 +101,6 @@ def format_timestamp(seconds: float) -> str:
     secs = int(seconds % 60)
     ms = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
-
-
-def create_nemo_manifest(audio_path: str, manifest_path: str):
-    """Создаёт manifest для NeMo."""
-    meta = {
-        "audio_filepath": audio_path,
-        "offset": 0,
-        "duration": None,
-        "label": "infer",
-        "text": "-",
-        "num_speakers": None,
-        "rttm_filepath": None,
-        "uem_filepath": None
-    }
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(meta, f, ensure_ascii=False)
-        f.write('\n')
-
-
-def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
-    """Запускает диаризацию NeMo."""
-    if not NEMO_AVAILABLE:
-        raise RuntimeError("NeMo не установлен. Диаризация недоступна.")
-
-    if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    manifest_path = os.path.join(output_dir, "manifest.json")
-    create_nemo_manifest(audio_path, manifest_path)
-
-    config = OmegaConf.create({
-        "device": device,
-        "diarizer": {
-            "manifest_filepath": manifest_path,
-            "out_dir": output_dir,
-            "oracle_vad": False,
-            "collar": 0.25,
-            "ignore_overlap": True,
-            "vad": {
-                "model_path": "vad_multilingual_marblenet",
-                "external_vad_manifest": None,
-                "parameters": {
-                    "window_length_in_sec": 0.15,
-                    "shift_length_in_sec": 0.01,
-                    "smoothing": "median",
-                    "overlap": 0.5,
-                    "onset": 0.1,
-                    "offset": 0.1,
-                    "pad_onset": 0.1,
-                    "pad_offset": 0,
-                    "min_duration_on": 0.2,
-                    "min_duration_off": 0.2,
-                    "filter_speech_first": True
-                }
-            },
-            "speaker_embeddings": {
-                "model_path": "titanet_large",
-                "parameters": {
-                    "window_length_in_sec": [1.5, 1.25, 1.0, 0.75, 0.5],
-                    "shift_length_in_sec": [0.75, 0.625, 0.5, 0.375, 0.25],
-                    "multiscale_weights": [1, 1, 1, 1, 1],
-                    "save_embeddings": False
-                }
-            },
-            "clustering": {
-                "parameters": {
-                    "oracle_num_speakers": False,
-                    "max_num_speakers": 8,
-                    "enhanced_count_thres": 80,
-                    "max_rp_threshold": 0.25,
-                    "sparse_search_volume": 30,
-                    "maj_vote_spk_count": False
-                }
-            }
-        }
-    })
-
-    sd_model = ClusteringDiarizer(cfg=config)
-    # Устанавливаем атрибут verbose, если его нет (для совместимости с разными версиями NeMo)
-    if not hasattr(sd_model, 'verbose'):
-        sd_model.verbose = False
-    sd_model.diarize()
-
-    rttm_file = os.path.join(output_dir, "pred_rttms",
-                             Path(audio_path).stem + ".rttm")
-
-    results = []
-    if os.path.exists(rttm_file):
-        with open(rttm_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 8:
-                    start = float(parts[3])
-                    duration = float(parts[4])
-                    speaker = parts[7]
-                    results.append({
-                        "start": start,
-                        "end": start + duration,
-                        "speaker": speaker
-                    })
-
-    return results
-
-
-def assign_speakers(segments, diarization):
-    """Назначает спикеров сегментам."""
-    for segment in segments:
-        seg_mid = (segment["start"] + segment["end"]) / 2
-        speaker = "SPEAKER_00"
-        for diar in diarization:
-            if diar["start"] <= seg_mid <= diar["end"]:
-                speaker = diar["speaker"]
-                break
-        segment["speaker"] = speaker
-    return segments
 
 
 def format_output(segments, format_type, diarize):
@@ -307,7 +188,7 @@ def transcribe(audio_file, language, model_size, diarize, output_format, progres
             try:
                 with tempfile.TemporaryDirectory() as temp_dir:
                     diarization = run_nemo_diarization(audio_file, temp_dir, device)
-                    segments = assign_speakers(segments, diarization)
+                    segments = assign_speakers_to_segments(segments, diarization)
             except Exception as e:
                 error_msg = str(e)
                 if "download" in error_msg.lower() or "url" in error_msg.lower():
