@@ -8,11 +8,28 @@ import os
 import gc
 import json
 import tempfile
+import atexit
 import torch
 import gradio as gr
+import numpy as np
+import soundfile as sf
 from pathlib import Path
 from datetime import datetime
 from faster_whisper import WhisperModel
+
+# Список временных файлов для очистки
+_temp_files = []
+
+def _cleanup_temp_files():
+    """Очищает временные файлы при завершении программы."""
+    for f in _temp_files:
+        try:
+            if os.path.exists(f):
+                os.unlink(f)
+        except Exception:
+            pass
+
+atexit.register(_cleanup_temp_files)
 
 # Проверяем доступность NeMo
 try:
@@ -43,9 +60,6 @@ def preload_nemo_models():
         # Создаем временную конфигурацию для предзагрузки
         with tempfile.TemporaryDirectory() as temp_dir:
             # Создаем минимальный тестовый аудиофайл (1 секунда тишины)
-            import numpy as np
-            import soundfile as sf
-            
             temp_audio = os.path.join(temp_dir, "temp_audio.wav")
             # Создаем 1 секунду тишины (16kHz, моно)
             silence = np.zeros(16000, dtype=np.float32)
@@ -56,9 +70,6 @@ def preload_nemo_models():
             
             config = OmegaConf.create({
                 "device": device,
-                "num_workers": 0,  # Отключаем многопоточность для DataLoader
-                "sample_rate": 16000,  # Частота дискретизации аудио
-                "verbose": False,  # Отключаем подробный вывод
                 "diarizer": {
                     "manifest_filepath": temp_manifest,
                     "out_dir": temp_dir,
@@ -108,8 +119,8 @@ def create_nemo_manifest(audio_path: str, manifest_path: str):
         "rttm_filepath": None,
         "uem_filepath": None
     }
-    with open(manifest_path, 'w') as f:
-        json.dump(meta, f)
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False)
         f.write('\n')
 
 
@@ -126,9 +137,6 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
 
     config = OmegaConf.create({
         "device": device,
-        "num_workers": 0,  # Отключаем многопоточность для DataLoader (0 = основной поток)
-        "sample_rate": 16000,  # Частота дискретизации аудио (стандарт для NeMo)
-        "verbose": False,  # Отключаем подробный вывод
         "diarizer": {
             "manifest_filepath": manifest_path,
             "out_dir": output_dir,
@@ -173,9 +181,6 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
             }
         }
     })
-    
-    # Отключаем struct mode, чтобы NeMo мог добавлять свои параметры
-    OmegaConf.set_struct(config, False)
 
     sd_model = ClusteringDiarizer(cfg=config)
     # Устанавливаем атрибут verbose, если его нет (для совместимости с разными версиями NeMo)
@@ -335,6 +340,7 @@ def transcribe(audio_file, language, model_size, diarize, output_format, progres
         temp_file = tempfile.NamedTemporaryFile(mode='w', suffix=ext, delete=False, encoding='utf-8')
         temp_file.write(result_text)
         temp_file.close()
+        _temp_files.append(temp_file.name)  # Регистрируем для cleanup
 
         # Статистика
         num_segments = len(segments)
@@ -361,7 +367,7 @@ def create_ui():
         try:
             device_info += f" ({torch.cuda.get_device_name(0)})"
         except Exception:
-            pass  # Игнорируем ошибки получения имени устройства
+            device_info += " (Unknown GPU)"
 
     with gr.Blocks(title="Транскрибатор", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🎙 Транскрибатор аудио")
@@ -438,13 +444,22 @@ if __name__ == "__main__":
     # Предзагружаем модели NeMo в фоновом потоке
     if NEMO_AVAILABLE:
         import threading
-        preload_thread = threading.Thread(target=preload_nemo_models, daemon=True)
+
+        def preload_nemo_models_wrapper():
+            """Обертка с обработкой ошибок для предзагрузки моделей."""
+            try:
+                preload_nemo_models()
+            except Exception as e:
+                print(f"[ERROR] Критическая ошибка при предзагрузке моделей NeMo: {e}")
+                print("  Диаризация может быть недоступна. Модели будут загружены при первом использовании.")
+
+        preload_thread = threading.Thread(target=preload_nemo_models_wrapper, daemon=True)
         preload_thread.start()
         print("[INFO] Предзагрузка моделей NeMo запущена в фоновом режиме...")
-    
+
     demo = create_ui()
     demo.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",  # Только локальный доступ для безопасности
         server_port=7860,
         share=False,
         inbrowser=True
