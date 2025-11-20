@@ -12,7 +12,6 @@ import tempfile
 import traceback
 import click
 import torch
-import numpy as np
 from pathlib import Path
 from datetime import datetime
 from faster_whisper import WhisperModel
@@ -51,8 +50,8 @@ def create_nemo_manifest(audio_path: str, manifest_path: str):
         "rttm_filepath": None,
         "uem_filepath": None
     }
-    with open(manifest_path, 'w') as f:
-        json.dump(meta, f)
+    with open(manifest_path, 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False)
         f.write('\n')
 
 
