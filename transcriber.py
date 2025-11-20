@@ -5,9 +5,7 @@
 Не требует регистрации или токенов.
 """
 
-import os
 import gc
-import json
 import tempfile
 import traceback
 import click
@@ -19,14 +17,13 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
+from nemo_utils import (
+    get_device,
+    run_nemo_diarization,
+    assign_speakers_to_segments
+)
+
 console = Console()
-
-
-def get_device():
-    """Определяет доступное устройство для вычислений."""
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
 
 
 def format_timestamp(seconds: float) -> str:
@@ -36,128 +33,6 @@ def format_timestamp(seconds: float) -> str:
     secs = int(seconds % 60)
     ms = int((seconds % 1) * 1000)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
-
-
-def create_nemo_manifest(audio_path: str, manifest_path: str):
-    """Создаёт manifest файл для NeMo."""
-    meta = {
-        "audio_filepath": audio_path,
-        "offset": 0,
-        "duration": None,
-        "label": "infer",
-        "text": "-",
-        "num_speakers": None,
-        "rttm_filepath": None,
-        "uem_filepath": None
-    }
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(meta, f, ensure_ascii=False)
-        f.write('\n')
-
-
-def run_nemo_diarization(audio_path: str, output_dir: str, device: str):
-    """Запускает диаризацию с помощью NeMo."""
-    from nemo.collections.asr.models import ClusteringDiarizer
-    from omegaconf import OmegaConf
-
-    # Создаём manifest
-    manifest_path = os.path.join(output_dir, "manifest.json")
-    create_nemo_manifest(audio_path, manifest_path)
-
-    # Конфигурация NeMo диаризатора
-    config = OmegaConf.create({
-        "device": device,
-        "diarizer": {
-            "manifest_filepath": manifest_path,
-            "out_dir": output_dir,
-            "oracle_vad": False,
-            "collar": 0.25,
-            "ignore_overlap": True,
-
-            "vad": {
-                "model_path": "vad_multilingual_marblenet",
-                "external_vad_manifest": None,
-                "parameters": {
-                    "window_length_in_sec": 0.15,
-                    "shift_length_in_sec": 0.01,
-                    "smoothing": "median",
-                    "overlap": 0.5,
-                    "onset": 0.1,
-                    "offset": 0.1,
-                    "pad_onset": 0.1,
-                    "pad_offset": 0,
-                    "min_duration_on": 0.2,
-                    "min_duration_off": 0.2,
-                    "filter_speech_first": True
-                }
-            },
-
-            "speaker_embeddings": {
-                "model_path": "titanet_large",
-                "parameters": {
-                    "window_length_in_sec": [1.5, 1.25, 1.0, 0.75, 0.5],
-                    "shift_length_in_sec": [0.75, 0.625, 0.5, 0.375, 0.25],
-                    "multiscale_weights": [1, 1, 1, 1, 1],
-                    "save_embeddings": False
-                }
-            },
-
-            "clustering": {
-                "parameters": {
-                    "oracle_num_speakers": False,
-                    "max_num_speakers": 8,
-                    "enhanced_count_thres": 80,
-                    "max_rp_threshold": 0.25,
-                    "sparse_search_volume": 30,
-                    "maj_vote_spk_count": False
-                }
-            }
-        }
-    })
-
-    # Запуск диаризации
-    sd_model = ClusteringDiarizer(cfg=config)
-    sd_model.diarize()
-
-    # Чтение результатов RTTM
-    rttm_file = os.path.join(output_dir, "pred_rttms",
-                             Path(audio_path).stem + ".rttm")
-
-    diarization_results = []
-    if os.path.exists(rttm_file):
-        with open(rttm_file, 'r') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 8:
-                    start = float(parts[3])
-                    duration = float(parts[4])
-                    speaker = parts[7]
-                    diarization_results.append({
-                        "start": start,
-                        "end": start + duration,
-                        "speaker": speaker
-                    })
-
-    return diarization_results
-
-
-def assign_speakers_to_segments(transcription_segments, diarization_results):
-    """Назначает спикеров сегментам транскрипции."""
-    for segment in transcription_segments:
-        seg_start = segment["start"]
-        seg_end = segment["end"]
-        seg_mid = (seg_start + seg_end) / 2
-
-        # Находим спикера для середины сегмента
-        speaker = "SPEAKER_00"
-        for diar in diarization_results:
-            if diar["start"] <= seg_mid <= diar["end"]:
-                speaker = diar["speaker"]
-                break
-
-        segment["speaker"] = speaker
-
-    return transcription_segments
 
 
 def save_results(result: dict, output_path: Path, format_type: str):
