@@ -57,7 +57,7 @@ def create_nemo_manifest(audio_path: str, manifest_path: str):
         f.write('\n')
 
 
-def run_nemo_diarization(audio_path: str, output_dir: str):
+def run_nemo_diarization(audio_path: str, output_dir: str, device: str = "cuda"):
     """Запускает диаризацию NeMo."""
     manifest_path = os.path.join(output_dir, "manifest.json")
     create_nemo_manifest(audio_path, manifest_path)
@@ -107,7 +107,12 @@ def run_nemo_diarization(audio_path: str, output_dir: str):
             }
         }
     })
-
+    
+    # Добавляем device в конфигурацию после создания (обход ограничения OmegaConf)
+    OmegaConf.set_struct(config, False)
+    config.diarizer.device = device
+    OmegaConf.set_struct(config, True)
+    
     sd_model = ClusteringDiarizer(cfg=config)
     sd_model.diarize()
 
@@ -225,7 +230,7 @@ def transcribe(audio_file, language, model_size, diarize, output_format, progres
             progress(0.6, desc="Диаризация спикеров...")
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                diarization = run_nemo_diarization(audio_file, temp_dir)
+                diarization = run_nemo_diarization(audio_file, temp_dir, device)
                 segments = assign_speakers(segments, diarization)
 
             gc.collect()
