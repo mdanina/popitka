@@ -118,6 +118,7 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
     # Конфигурация NeMo диаризатора
     config = OmegaConf.create({
         "device": device,
+        "sample_rate": 16000,
         "diarizer": {
             "manifest_filepath": manifest_path,
             "out_dir": output_dir,
