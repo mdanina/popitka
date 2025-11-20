@@ -1,0 +1,14 @@
+C:\Users\user\miniforge3\Lib\site-packages\ctranslate2\__init__.py:8: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
+  import pkg_resources
+[NeMo W 2025-11-20 15:46:52 nemo_logging:405] Megatron num_microbatches_calculator not found, using Apex version.
+OneLogger: Setting error_handling_strategy to DISABLE_QUIETLY_AND_REPORT_METRIC_ERROR for rank (rank=0) with OneLogger disabled. To override: explicitly set error_handling_strategy parameter.
+No exporters were provided. This means that no telemetry data will be collected.
+Traceback (most recent call last):
+  File "C:\Users\user\popitka\popitka\ui.py", line 424, in <module>
+    preload_nemo_models()
+  File "C:\Users\user\popitka\popitka\ui.py", line 39, in preload_nemo_models
+    print("\U0001f4e5 Предзагрузка моделей NeMo...")
+  File "C:\Users\user\miniforge3\Lib\encodings\cp1251.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f4e5' in position 0: character maps to <undefined>

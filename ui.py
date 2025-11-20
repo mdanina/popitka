@@ -31,6 +31,62 @@ def get_device():
     return "cpu"
 
 
+def preload_nemo_models():
+    """Предзагружает модели NeMo при запуске приложения."""
+    if not NEMO_AVAILABLE:
+        return
+    
+    print("[INFO] Предзагрузка моделей NeMo...")
+    try:
+        device = get_device()
+        
+        # Создаем временную конфигурацию для предзагрузки
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Создаем минимальный тестовый аудиофайл (1 секунда тишины)
+            import numpy as np
+            import soundfile as sf
+            
+            temp_audio = os.path.join(temp_dir, "temp_audio.wav")
+            # Создаем 1 секунду тишины (16kHz, моно)
+            silence = np.zeros(16000, dtype=np.float32)
+            sf.write(temp_audio, silence, 16000)
+            
+            temp_manifest = os.path.join(temp_dir, "temp_manifest.json")
+            create_nemo_manifest(temp_audio, temp_manifest)
+            
+            config = OmegaConf.create({
+                "device": device,
+                "num_workers": 0,  # Отключаем многопоточность для DataLoader
+                "sample_rate": 16000,  # Частота дискретизации аудио
+                "verbose": False,  # Отключаем подробный вывод
+                "diarizer": {
+                    "manifest_filepath": temp_manifest,
+                    "out_dir": temp_dir,
+                    "vad": {
+                        "model_path": "vad_multilingual_marblenet"
+                    },
+                    "speaker_embeddings": {
+                        "model_path": "titanet_large"
+                    }
+                }
+            })
+            
+            # Создаем диаризатор - это заставит NeMo скачать модели
+            print("[INFO] Загрузка VAD модели (vad_multilingual_marblenet)...")
+            print("[INFO] Загрузка Speaker Embeddings модели (titanet_large)...")
+            print("[INFO] Это может занять несколько минут при первом запуске...")
+            sd_model = ClusteringDiarizer(cfg=config)
+            # Устанавливаем атрибут verbose, если его нет (для совместимости с разными версиями NeMo)
+            if not hasattr(sd_model, 'verbose'):
+                sd_model.verbose = False
+            # Не вызываем diarize(), просто инициализация загрузит модели
+            print("[SUCCESS] Модели NeMo успешно загружены в кэш")
+            
+    except Exception as e:
+        print(f"⚠ Предупреждение: не удалось предзагрузить модели NeMo: {e}")
+        print("  Модели будут загружены при первом использовании диаризации")
+
+
 def format_timestamp(seconds: float) -> str:
     """Форматирует время."""
     hours = int(seconds // 3600)
@@ -70,6 +126,9 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
 
     config = OmegaConf.create({
         "device": device,
+        "num_workers": 0,  # Отключаем многопоточность для DataLoader (0 = основной поток)
+        "sample_rate": 16000,  # Частота дискретизации аудио (стандарт для NeMo)
+        "verbose": False,  # Отключаем подробный вывод
         "diarizer": {
             "manifest_filepath": manifest_path,
             "out_dir": output_dir,
@@ -114,8 +173,14 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
             }
         }
     })
+    
+    # Отключаем struct mode, чтобы NeMo мог добавлять свои параметры
+    OmegaConf.set_struct(config, False)
 
     sd_model = ClusteringDiarizer(cfg=config)
+    # Устанавливаем атрибут verbose, если его нет (для совместимости с разными версиями NeMo)
+    if not hasattr(sd_model, 'verbose'):
+        sd_model.verbose = False
     sd_model.diarize()
 
     rttm_file = os.path.join(output_dir, "pred_rttms",
@@ -234,9 +299,24 @@ def transcribe(audio_file, language, model_size, diarize, output_format, progres
         if diarize and NEMO_AVAILABLE:
             progress(0.6, desc="Диаризация спикеров...")
 
-            with tempfile.TemporaryDirectory() as temp_dir:
-                diarization = run_nemo_diarization(audio_file, temp_dir, device)
-                segments = assign_speakers(segments, diarization)
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    diarization = run_nemo_diarization(audio_file, temp_dir, device)
+                    segments = assign_speakers(segments, diarization)
+            except Exception as e:
+                error_msg = str(e)
+                if "download" in error_msg.lower() or "url" in error_msg.lower():
+                    return (
+                        f"Ошибка загрузки моделей NeMo: {error_msg}\n\n"
+                        "Возможные решения:\n"
+                        "1. Проверьте интернет-соединение\n"
+                        "2. Попробуйте позже (серверы NeMo могут быть временно недоступны)\n"
+                        "3. Отключите диаризацию спикеров и попробуйте без неё",
+                        None,
+                        ""
+                    )
+                else:
+                    return f"Ошибка диаризации: {error_msg}", None, ""
 
             gc.collect()
             if device == "cuda":
@@ -355,6 +435,13 @@ def create_ui():
 
 
 if __name__ == "__main__":
+    # Предзагружаем модели NeMo в фоновом потоке
+    if NEMO_AVAILABLE:
+        import threading
+        preload_thread = threading.Thread(target=preload_nemo_models, daemon=True)
+        preload_thread.start()
+        print("[INFO] Предзагрузка моделей NeMo запущена в фоновом режиме...")
+    
     demo = create_ui()
     demo.launch(
         server_name="0.0.0.0",
