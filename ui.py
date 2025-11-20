@@ -140,6 +140,7 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
         "diarizer": {
             "manifest_filepath": manifest_path,
             "out_dir": output_dir,
+            "device": device,
             "oracle_vad": False,
             "collar": 0.25,
             "ignore_overlap": True,
