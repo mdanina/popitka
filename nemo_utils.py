@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 Утилиты для работы с NVIDIA NeMo диаризацией.
-Общий код для transcriber.py и ui.py.
+Простой подход на основе извлечения эмбеддингов и кластеризации.
 """
 
 import os
-import json
-from pathlib import Path
-
+import tempfile
+import numpy as np
+import librosa
+import soundfile as sf
 import torch
+from sklearn.cluster import SpectralClustering
+from sklearn.metrics import silhouette_score
 
 # Проверяем доступность NeMo
 try:
-    from nemo.collections.asr.models import ClusteringDiarizer
-    from omegaconf import OmegaConf
+    from nemo.collections.asr.models import EncDecSpeakerLabelModel
     NEMO_AVAILABLE = True
 except ImportError:
     NEMO_AVAILABLE = False
@@ -26,78 +28,185 @@ def get_device():
     return "cpu"
 
 
-def create_nemo_manifest(audio_path: str, manifest_path: str):
+# Глобальная переменная для кэширования модели
+_cached_model = None
+_cached_device = None
+
+
+def _load_speaker_model(device: str):
     """
-    Создаёт manifest файл для NeMo диаризации.
+    Загружает модель для извлечения эмбеддингов спикеров.
+    Кэширует модель для повторного использования.
+    """
+    global _cached_model, _cached_device
+
+    if _cached_model is not None and _cached_device == device:
+        return _cached_model
+
+    print("Загрузка модели speaker embeddings (titanet_large)...")
+
+    # Пробуем загрузить модель
+    repo = "nvidia/speakerverification_en_titanet_large"
+    token = os.getenv("HF_TOKEN")
+
+    try:
+        if token:
+            model = EncDecSpeakerLabelModel.from_pretrained(repo, token=token)
+        else:
+            model = EncDecSpeakerLabelModel.from_pretrained(repo)
+    except TypeError:
+        # Fallback без токена
+        model = EncDecSpeakerLabelModel.from_pretrained(repo)
+
+    model = model.to(device).eval()
+    _cached_model = model
+    _cached_device = device
+
+    return model
+
+
+def extract_embeddings(wav: np.ndarray, sr: int, model,
+                       win_s: float = 3.0, step_s: float = 1.5):
+    """
+    Извлекает эмбеддинги спикеров из аудио.
 
     Args:
-        audio_path: Путь к аудиофайлу
-        manifest_path: Путь для сохранения manifest файла
+        wav: Аудио данные (numpy array)
+        sr: Частота дискретизации
+        model: Модель NeMo для извлечения эмбеддингов
+        win_s: Размер окна в секундах
+        step_s: Шаг окна в секундах
+
+    Returns:
+        tuple: (эмбеддинги, временные метки)
     """
-    meta = {
-        "audio_filepath": audio_path,
-        "offset": 0,
-        "duration": None,
-        "label": "infer",
-        "text": "-",
-        "num_speakers": None,
-        "rttm_filepath": None,
-        "uem_filepath": None
-    }
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(meta, f, ensure_ascii=False)
-        f.write('\n')
+    embs = []
+    stamps = []
+    t = 0.0
+    total_dur = len(wav) / sr
+
+    while t + win_s <= total_dur:
+        # Извлекаем сегмент аудио
+        segment = wav[int(t * sr): int((t + win_s) * sr)]
+
+        # Создаём временный wav файл
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            sf.write(tmp.name, segment, sr)
+            tmp_path = tmp.name
+
+        try:
+            # Получаем эмбеддинг
+            with torch.no_grad():
+                emb = model.get_embedding(tmp_path).cpu().numpy().squeeze()
+
+            # Нормализуем эмбеддинг
+            emb_norm = emb / (np.linalg.norm(emb) + 1e-8)
+            embs.append(emb_norm)
+            stamps.append((t, t + win_s))
+        finally:
+            os.remove(tmp_path)
+
+        t += step_s
+
+    if len(embs) == 0:
+        return np.array([]), []
+
+    return np.stack(embs), stamps
 
 
-# Конфигурация NeMo диаризации
-# Эти параметры оптимизированы для общего использования
-NEMO_CONFIG = {
-    # VAD (Voice Activity Detection) параметры
-    "vad": {
-        "model_path": "vad_multilingual_marblenet",
-        "window_length_in_sec": 0.15,
-        "shift_length_in_sec": 0.01,
-        "smoothing": "median",
-        "overlap": 0.5,
-        "onset": 0.1,
-        "offset": 0.1,
-        "pad_onset": 0.1,
-        "pad_offset": 0,
-        "min_duration_on": 0.2,
-        "min_duration_off": 0.2,
-        "filter_speech_first": True
-    },
-    # Speaker Embeddings параметры
-    "speaker_embeddings": {
-        "model_path": "titanet_large",
-        "window_length_in_sec": [1.5, 1.25, 1.0, 0.75, 0.5],
-        "shift_length_in_sec": [0.75, 0.625, 0.5, 0.375, 0.25],
-        "multiscale_weights": [1, 1, 1, 1, 1],
-        "save_embeddings": False
-    },
-    # Clustering параметры
-    "clustering": {
-        "oracle_num_speakers": False,
-        "max_num_speakers": 8,
-        "enhanced_count_thres": 80,
-        "max_rp_threshold": 0.25,
-        "sparse_search_volume": 30,
-        "maj_vote_spk_count": False
-    },
-    # Общие параметры
-    "collar": 0.25,
-    "ignore_overlap": True
-}
+def auto_cluster(embs: np.ndarray, max_k: int = 8):
+    """
+    Автоматически определяет число спикеров и кластеризует эмбеддинги.
+
+    Args:
+        embs: Матрица эмбеддингов
+        max_k: Максимальное число спикеров
+
+    Returns:
+        numpy.ndarray: Метки кластеров
+    """
+    if len(embs) < 2:
+        return np.zeros(len(embs), dtype=int)
+
+    # Ограничиваем max_k количеством сэмплов
+    max_k = min(max_k, len(embs))
+
+    best_labels = None
+    best_score = -1
+
+    # Перебираем число кластеров от 2 до max_k
+    for k in range(2, max_k + 1):
+        try:
+            clustering = SpectralClustering(
+                n_clusters=k,
+                affinity="nearest_neighbors",
+                n_neighbors=min(10, len(embs) - 1),
+                random_state=42
+            )
+            labels = clustering.fit_predict(embs)
+
+            # Оцениваем качество кластеризации
+            if len(set(labels)) > 1:
+                score = silhouette_score(embs, labels)
+                if score > best_score:
+                    best_labels = labels
+                    best_score = score
+        except Exception:
+            # Пропускаем если кластеризация не удалась
+            continue
+
+    # Если ничего не сработало, считаем что 1 спикер
+    if best_labels is None:
+        return np.zeros(len(embs), dtype=int)
+
+    return best_labels
 
 
-def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
+def merge_segments(stamps, labels, gap: float = 0.5):
+    """
+    Объединяет последовательные сегменты одного спикера.
+
+    Args:
+        stamps: Список временных меток (start, end)
+        labels: Метки спикеров
+        gap: Максимальный разрыв для объединения
+
+    Returns:
+        list: Объединённые сегменты
+    """
+    if len(stamps) == 0:
+        return []
+
+    merged = []
+    cur = {"speaker": f"speaker_{int(labels[0])}", "start": stamps[0][0], "end": stamps[0][1]}
+
+    for (s, e), lab in zip(stamps[1:], labels[1:]):
+        speaker_label = f"speaker_{int(lab)}"
+
+        # Если тот же спикер и небольшой разрыв - объединяем
+        if speaker_label == cur["speaker"] and s <= cur["end"] + gap:
+            cur["end"] = e
+        else:
+            merged.append(cur)
+            cur = {"speaker": speaker_label, "start": s, "end": e}
+
+    merged.append(cur)
+    return merged
+
+
+def run_nemo_diarization(audio_path: str, output_dir: str = None, device: str = None,
+                         max_speakers: int = 8, window_size: float = 3.0,
+                         step_size: float = 1.5):
     """
     Запускает диаризацию с помощью NeMo.
 
     Args:
         audio_path: Путь к аудиофайлу
-        output_dir: Директория для вывода результатов
+        output_dir: Директория для вывода (не используется в новой версии)
         device: Устройство для вычислений ('cuda' или 'cpu')
+        max_speakers: Максимальное число спикеров
+        window_size: Размер окна для извлечения эмбеддингов (секунды)
+        step_size: Шаг окна (секунды)
 
     Returns:
         list: Список сегментов с информацией о спикерах
@@ -111,87 +220,36 @@ def run_nemo_diarization(audio_path: str, output_dir: str, device: str = None):
     if device is None:
         device = get_device()
 
-    # Создаём manifest
-    manifest_path = os.path.join(output_dir, "manifest.json")
-    create_nemo_manifest(audio_path, manifest_path)
+    # Загружаем модель
+    model = _load_speaker_model(device)
 
-    # Конфигурация NeMo диаризатора
-    config = OmegaConf.create({
-        "device": device,
-        "sample_rate": 16000,
-        "diarizer": {
-            "manifest_filepath": manifest_path,
-            "out_dir": output_dir,
-            "oracle_vad": False,
-            "collar": NEMO_CONFIG["collar"],
-            "ignore_overlap": NEMO_CONFIG["ignore_overlap"],
+    # Читаем аудио
+    print("Чтение аудио...")
+    wav, sr = librosa.load(audio_path, sr=16000, mono=True)
 
-            "vad": {
-                "model_path": NEMO_CONFIG["vad"]["model_path"],
-                "external_vad_manifest": None,
-                "parameters": {
-                    "window_length_in_sec": NEMO_CONFIG["vad"]["window_length_in_sec"],
-                    "shift_length_in_sec": NEMO_CONFIG["vad"]["shift_length_in_sec"],
-                    "smoothing": NEMO_CONFIG["vad"]["smoothing"],
-                    "overlap": NEMO_CONFIG["vad"]["overlap"],
-                    "onset": NEMO_CONFIG["vad"]["onset"],
-                    "offset": NEMO_CONFIG["vad"]["offset"],
-                    "pad_onset": NEMO_CONFIG["vad"]["pad_onset"],
-                    "pad_offset": NEMO_CONFIG["vad"]["pad_offset"],
-                    "min_duration_on": NEMO_CONFIG["vad"]["min_duration_on"],
-                    "min_duration_off": NEMO_CONFIG["vad"]["min_duration_off"],
-                    "filter_speech_first": NEMO_CONFIG["vad"]["filter_speech_first"]
-                }
-            },
+    # Проверяем длительность
+    duration = len(wav) / sr
+    if duration < window_size:
+        print(f"Аудио слишком короткое ({duration:.1f}s < {window_size}s). Один спикер.")
+        return [{"start": 0.0, "end": duration, "speaker": "speaker_0"}]
 
-            "speaker_embeddings": {
-                "model_path": NEMO_CONFIG["speaker_embeddings"]["model_path"],
-                "parameters": {
-                    "window_length_in_sec": NEMO_CONFIG["speaker_embeddings"]["window_length_in_sec"],
-                    "shift_length_in_sec": NEMO_CONFIG["speaker_embeddings"]["shift_length_in_sec"],
-                    "multiscale_weights": NEMO_CONFIG["speaker_embeddings"]["multiscale_weights"],
-                    "save_embeddings": NEMO_CONFIG["speaker_embeddings"]["save_embeddings"]
-                }
-            },
+    # Извлекаем эмбеддинги
+    print("Извлечение эмбеддингов...")
+    embs, stamps = extract_embeddings(wav, sr, model, window_size, step_size)
 
-            "clustering": {
-                "parameters": {
-                    "oracle_num_speakers": NEMO_CONFIG["clustering"]["oracle_num_speakers"],
-                    "max_num_speakers": NEMO_CONFIG["clustering"]["max_num_speakers"],
-                    "enhanced_count_thres": NEMO_CONFIG["clustering"]["enhanced_count_thres"],
-                    "max_rp_threshold": NEMO_CONFIG["clustering"]["max_rp_threshold"],
-                    "sparse_search_volume": NEMO_CONFIG["clustering"]["sparse_search_volume"],
-                    "maj_vote_spk_count": NEMO_CONFIG["clustering"]["maj_vote_spk_count"]
-                }
-            }
-        }
-    })
+    if len(embs) == 0:
+        print("Не удалось извлечь эмбеддинги. Один спикер.")
+        return [{"start": 0.0, "end": duration, "speaker": "speaker_0"}]
 
-    # Запуск диаризации
-    sd_model = ClusteringDiarizer(cfg=config)
-    # Устанавливаем атрибут verbose для совместимости с разными версиями NeMo
-    if not hasattr(sd_model, 'verbose'):
-        sd_model.verbose = False
-    sd_model.diarize()
+    # Кластеризуем
+    print(f"Кластеризация (до {max_speakers} спикеров)...")
+    labels = auto_cluster(embs, max_k=max_speakers)
 
-    # Чтение результатов RTTM
-    rttm_file = os.path.join(output_dir, "pred_rttms",
-                             Path(audio_path).stem + ".rttm")
+    num_speakers = len(set(labels))
+    print(f"Найдено спикеров: {num_speakers}")
 
-    diarization_results = []
-    if os.path.exists(rttm_file):
-        with open(rttm_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) >= 8:
-                    start = float(parts[3])
-                    duration = float(parts[4])
-                    speaker = parts[7]
-                    diarization_results.append({
-                        "start": start,
-                        "end": start + duration,
-                        "speaker": speaker
-                    })
+    # Объединяем сегменты
+    diarization_results = merge_segments(stamps, labels)
 
     return diarization_results
 
@@ -200,8 +258,7 @@ def assign_speakers_to_segments(transcription_segments, diarization_results):
     """
     Назначает спикеров сегментам транскрипции.
 
-    Для каждого сегмента транскрипции находит спикера,
-    который говорил в середине этого сегмента.
+    Использует пересечение интервалов для более точного определения спикера.
 
     Args:
         transcription_segments: Список сегментов транскрипции
@@ -210,18 +267,56 @@ def assign_speakers_to_segments(transcription_segments, diarization_results):
     Returns:
         list: Сегменты транскрипции с назначенными спикерами
     """
+    if not diarization_results:
+        # Если нет результатов диаризации, назначаем всем один спикер
+        for segment in transcription_segments:
+            segment["speaker"] = "speaker_0"
+        return transcription_segments
+
     for segment in transcription_segments:
         seg_start = segment["start"]
         seg_end = segment["end"]
-        seg_mid = (seg_start + seg_end) / 2
 
-        # Находим спикера для середины сегмента
-        speaker = "SPEAKER_00"
+        # Находим спикера по пересечению интервалов
+        speaker = "speaker_0"
+        max_overlap = 0
+
         for diar in diarization_results:
-            if diar["start"] <= seg_mid <= diar["end"]:
+            # Вычисляем пересечение интервалов
+            overlap_start = max(seg_start, diar["start"])
+            overlap_end = min(seg_end, diar["end"])
+            overlap = max(0, overlap_end - overlap_start)
+
+            if overlap > max_overlap:
+                max_overlap = overlap
                 speaker = diar["speaker"]
-                break
+
+        # Fallback: если нет пересечения, ищем по середине сегмента
+        if max_overlap == 0:
+            seg_mid = (seg_start + seg_end) / 2
+            for diar in diarization_results:
+                if diar["start"] <= seg_mid <= diar["end"]:
+                    speaker = diar["speaker"]
+                    break
 
         segment["speaker"] = speaker
 
     return transcription_segments
+
+
+def preload_models(device: str = None):
+    """
+    Предзагружает модели NeMo в память.
+    Вызывается для ускорения первой диаризации.
+
+    Args:
+        device: Устройство для загрузки модели
+    """
+    if not NEMO_AVAILABLE:
+        return
+
+    if device is None:
+        device = get_device()
+
+    _load_speaker_model(device)
+    print("Модель speaker embeddings загружена.")
